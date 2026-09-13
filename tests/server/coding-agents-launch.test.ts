@@ -4,6 +4,8 @@ import { tmpdir } from 'os'
 import { dirname, join } from 'path'
 import { afterEach, beforeEach, describe, expect, it, vi } from 'vitest'
 import { parse as parseToml } from 'smol-toml'
+import { parse as parseYaml } from 'yaml'
+import { readDshMcpServers } from '../../packages/server/src/modules/coding-agents/services/dsh/config'
 import { claudeProxyMessages, claudeProxyModels, registerClaudeCodeProxyTarget } from '../../packages/server/src/modules/coding-agents/services/claude-code/proxy'
 import {
   revokeCodexProxyTargets,
@@ -31,6 +33,15 @@ import { codingAgentRunManager } from '../../packages/server/src/modules/coding-
 import { configureProfileConfig } from '../../packages/server/src/modules/studio/public/profile-config'
 import * as providerRuntime from '../../packages/server/src/modules/studio/public/provider-runtime'
 import { upsertCodingAgentMcpServer } from '../../packages/server/src/modules/coding-agents/services/mcp-manager'
+
+// Registry tests verify isolated homes/model injection without requiring a
+// machine-wide DSH install. Real Web composition is covered by dsh-web-real.
+vi.mock('../../packages/server/src/modules/coding-agents/services/dsh/host', async original => {
+  const actual = await original<typeof import('../../packages/server/src/modules/coding-agents/services/dsh/host')>()
+  return { ...actual, createDshHost: (host: Parameters<typeof actual.createDshHost>[0]) => ({
+    ...actual.createDshHost(host), runtimeInput: async () => ({ sourceHome: host.getSourceHome(), launchPath: '/fixture/bin' }),
+  }) }
+})
 
 const homes: string[] = []
 
@@ -74,6 +85,32 @@ function makeHome() {
 
 beforeEach(() => {
   mockProcessUid(1000)
+})
+
+it.each(['scoped', 'global'] as const)('prepares DSH %s ACP homes independently for simultaneous conversations', async mode => {
+  const home = makeHome()
+  const input = { mode, profile: 'default', provider: 'custom:test', model: 'test-model',
+    baseUrl: 'https://api.example.com/v1', apiKey: 'upstream-test-secret', apiMode: 'chat_completions',
+    workspace: join(home, 'workspace'), groupSystemPrompt: 'DSH group instructions' }
+  const launch = await prepareCodingAgentLaunch('dsh', { ...input, sessionId: 'one', agentSessionId: 'run-one' })
+  const other = await prepareCodingAgentLaunch('dsh', { ...input, sessionId: 'two', agentSessionId: 'run-two' })
+  expect(launch.rootDir).not.toBe(other.rootDir)
+  expect(launch.env.DSH_HOME).toBe(launch.rootDir)
+  expect(launch.env.DSH_PERMISSION_MODE).toBe('danger-full-access')
+  expect(launch.env.PATH).toContain('/fixture/bin')
+  expect(launch.args).toEqual(['--profile', 'acp', '--patch', join(launch.rootDir, 'studio.patch.yml')])
+  expect(readFileSync(launch.promptFile!, 'utf8')).toContain('DSH group instructions')
+  const servers = readDshMcpServers(readFileSync(join(launch.rootDir, 'cordis.patch.yml'), 'utf8'))
+  expect(servers.size).toBeGreaterThanOrEqual(4)
+  for (const server of servers.values()) expect(server.env.ELECTRON_RUN_AS_NODE).toBe('1')
+  const overlay = readFileSync(join(launch.rootDir, 'studio.patch.yml'), 'utf8')
+  expect(overlay).not.toContain('upstream-test-secret')
+  const acpConfig = parseYaml(overlay).find((row: any) => row.id === 'acp')
+  if (mode === 'scoped') {
+    expect(acpConfig.config).toEqual({ provider: 'ekko-studio', model: 'test-model' })
+    expect(launch.env.HERMES_DSH_API_KEY).toBeTruthy()
+    expect(launch.env.HERMES_DSH_API_KEY).not.toBe('upstream-test-secret')
+  } else expect(acpConfig).toBeUndefined()
 })
 
 afterEach(() => {
@@ -647,6 +684,106 @@ describe('coding agent launch preparation', () => {
       reasoning: true,
       thinkingLevelMap: { xhigh: 'xhigh', max: 'max' },
     })
+  })
+
+  it.each([
+    'pi-mcp-adapter@2.32.1',
+    'npm:pi-mcp-adapter',
+    'npm:pi-mcp-adapter@2.32.1',
+    { source: 'npm:pi-mcp-adapter@2.32.1' },
+  ])('reuses a user Pi MCP adapter package %j without the bundle', async (adapterPackage) => {
+    const home = makeHome()
+    const liveSettingsPath = join(home, 'global-home', '.pi', 'agent', 'settings.json')
+    mkdirSync(dirname(liveSettingsPath), { recursive: true })
+    writeFileSync(liveSettingsPath, `${JSON.stringify({
+      packages: [adapterPackage],
+    }, null, 2)}\n`)
+
+    const result = await prepareCodingAgentLaunch('pi', {
+      profile: 'default',
+      provider: 'custom:test',
+      model: 'test-model',
+      baseUrl: 'https://api.example.com/v1',
+      apiKey: 'sk-runtime-secret',
+      apiMode: 'codex_responses',
+      sessionId: 'session-user-adapter',
+      agentSessionId: 'agent-session-user-adapter',
+    })
+
+    const runtimeSettings = JSON.parse(readFileSync(join(result.rootDir, 'settings.json'), 'utf-8'))
+    const bundledEntry = join(home, 'coding-agent', 'pi-mcp-adapter', 'node_modules', 'pi-mcp-adapter', 'index.ts')
+    expect(runtimeSettings.extensions).not.toContain(bundledEntry)
+    expect(runtimeSettings.extensions).toContain(join(result.rootDir, 'hermes-studio-runtime.ts'))
+    // The user's own package selection is preserved so Pi loads their adapter.
+    expect(runtimeSettings.packages).toEqual([
+      typeof adapterPackage === 'string' && !adapterPackage.startsWith('npm:') ? `npm:${adapterPackage}` : adapterPackage,
+    ])
+  })
+
+  it('preserves a relative user adapter extension alongside an inherited bundled entry', async () => {
+    const home = makeHome()
+    const liveDir = join(home, 'global-home', '.pi', 'agent')
+    const userAdapter = join(liveDir, 'node_modules', 'pi-mcp-adapter', 'index.ts')
+    mkdirSync(dirname(userAdapter), { recursive: true })
+    writeFileSync(userAdapter, 'export default function () {}')
+    const liveSettings = JSON.stringify({ extensions: ['./node_modules/pi-mcp-adapter/index.ts'] })
+    writeFileSync(join(liveDir, 'settings.json'), liveSettings)
+    const bundle = join(home, 'coding-agent', 'pi-mcp-adapter', 'node_modules', 'pi-mcp-adapter', 'index.ts')
+    const scopedDir = join(home, 'coding-agent', 'model', 'default', 'custom_test', 'pi')
+    mkdirSync(scopedDir, { recursive: true })
+    writeFileSync(join(scopedDir, 'settings.json'), JSON.stringify({ extensions: [bundle, './custom.ts'] }))
+    const result = await prepareCodingAgentLaunch('pi', {
+      profile: 'default', provider: 'custom:test', model: 'test-model',
+      baseUrl: 'https://api.example.com/v1', apiKey: 'test-key', apiMode: 'codex_responses',
+    })
+    const settings = JSON.parse(readFileSync(join(result.rootDir, 'settings.json'), 'utf-8'))
+    expect(settings.extensions).toContain(userAdapter)
+    expect(settings.extensions).toContain(join(scopedDir, 'custom.ts'))
+    expect(settings.extensions).not.toContain(bundle)
+    expect(settings.extensions).toContain(join(result.rootDir, 'hermes-studio-runtime.ts'))
+    expect(readFileSync(join(liveDir, 'settings.json'), 'utf-8')).toBe(liveSettings)
+  })
+
+  it('falls back to the bundle when scoped settings disable the live adapter package', async () => {
+    const home = makeHome()
+    const liveDir = join(home, 'global-home', '.pi', 'agent')
+    mkdirSync(liveDir, { recursive: true })
+    writeFileSync(join(liveDir, 'settings.json'), JSON.stringify({ packages: ['npm:pi-mcp-adapter'] }))
+    const bundle = join(home, 'coding-agent', 'pi-mcp-adapter', 'node_modules', 'pi-mcp-adapter', 'index.ts')
+    mkdirSync(dirname(bundle), { recursive: true })
+    writeFileSync(bundle, 'export default function () {}')
+    const scopedDir = join(home, 'coding-agent', 'model', 'default', 'custom_test', 'pi')
+    mkdirSync(scopedDir, { recursive: true })
+    const packages = [{ source: 'npm:pi-mcp-adapter', extensions: [] }]
+    writeFileSync(join(scopedDir, 'settings.json'), JSON.stringify({ packages }))
+    const result = await prepareCodingAgentLaunch('pi', {
+      profile: 'default', provider: 'custom:test', model: 'test-model',
+      baseUrl: 'https://api.example.com/v1', apiKey: 'test-key', apiMode: 'codex_responses',
+    })
+    const settings = JSON.parse(readFileSync(join(result.rootDir, 'settings.json'), 'utf-8'))
+    expect(settings.extensions).toContain(bundle)
+    expect(settings.packages).toEqual(packages)
+  })
+
+  it('injects the bundled Pi MCP adapter when the user has no pi-mcp-adapter installed', async () => {
+    const home = makeHome()
+    const adapterEntry = join(home, 'coding-agent', 'pi-mcp-adapter', 'node_modules', 'pi-mcp-adapter', 'index.ts')
+    mkdirSync(dirname(adapterEntry), { recursive: true })
+    writeFileSync(adapterEntry, 'export default {}')
+
+    const result = await prepareCodingAgentLaunch('pi', {
+      profile: 'default',
+      provider: 'custom:test',
+      model: 'test-model',
+      baseUrl: 'https://api.example.com/v1',
+      apiKey: 'sk-runtime-secret',
+      apiMode: 'codex_responses',
+      sessionId: 'session-bundled-adapter',
+      agentSessionId: 'agent-session-bundled-adapter',
+    })
+
+    const runtimeSettings = JSON.parse(readFileSync(join(result.rootDir, 'settings.json'), 'utf-8'))
+    expect(runtimeSettings.extensions).toContain(adapterEntry)
   })
 
   it('migrates legacy plaintext Pi proxy targets to encrypted storage during restore', async () => {
@@ -2935,7 +3072,7 @@ describe('coding agent launch preparation', () => {
     const target = registerClaudeCodeProxyTarget({
       provider: 'fun-codex',
       model: 'gpt-5.5',
-      baseUrl: 'https://api.apikey.fun/v1',
+      baseUrl: 'https://api.apikey.fan/v1',
       apiKey: 'sk-upstream',
       apiMode: 'codex_responses',
     })
@@ -2957,7 +3094,7 @@ describe('coding agent launch preparation', () => {
 
     await claudeProxyMessages(ctx)
 
-    expect(fetchMock).toHaveBeenCalledWith('https://api.apikey.fun/v1/responses', expect.objectContaining({
+    expect(fetchMock).toHaveBeenCalledWith('https://api.apikey.fan/v1/responses', expect.objectContaining({
       method: 'POST',
       headers: expect.objectContaining({ Authorization: 'Bearer sk-upstream' }),
     }))
@@ -2983,7 +3120,7 @@ describe('coding agent launch preparation', () => {
     const target = registerClaudeCodeProxyTarget({
       provider: 'fun-codex',
       model: 'gpt-5.5',
-      baseUrl: 'https://api.apikey.fun/v1',
+      baseUrl: 'https://api.apikey.fan/v1',
       apiKey: 'sk-upstream',
       apiMode: 'codex_responses',
     })
@@ -3146,7 +3283,7 @@ describe('coding agent launch preparation', () => {
     const target = registerClaudeCodeProxyTarget({
       provider: 'fun-claude',
       model: 'claude-sonnet-4-6',
-      baseUrl: 'https://api.apikey.fun',
+      baseUrl: 'https://api.apikey.fan',
       apiKey: 'sk-upstream',
       apiMode: 'anthropic_messages',
     })
@@ -3169,7 +3306,7 @@ describe('coding agent launch preparation', () => {
 
     await claudeProxyMessages(ctx)
 
-    expect(fetchMock).toHaveBeenCalledWith('https://api.apikey.fun/v1/messages', expect.objectContaining({
+    expect(fetchMock).toHaveBeenCalledWith('https://api.apikey.fan/v1/messages', expect.objectContaining({
       method: 'POST',
       headers: expect.objectContaining({
         Authorization: 'Bearer sk-upstream',

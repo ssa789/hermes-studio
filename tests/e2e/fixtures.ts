@@ -204,6 +204,11 @@ export async function mockHermesApi(page: Page, options: MockHermesApiOptions = 
 
     requests.push(recordRequest(request))
 
+    if (pathname === '/api/studio/announcements') {
+      await route.fulfill(jsonResponse({ ok: true, platform: 'desktop', list: [] }))
+      return
+    }
+
     if (pathname === '/health') {
       await route.fulfill(jsonResponse({ status: 'ok', webui_version: '0.5.23', node_version: '23.0.0' }))
       return
@@ -220,6 +225,7 @@ export async function mockHermesApi(page: Page, options: MockHermesApiOptions = 
           { id: 'codex', name: 'Codex', provider: 'OpenAI', kind: 'coding-agent', installed: true, version: '1.0.0', source: 'user-cli', path: '/usr/local/bin/codex', error: '', installations: [] },
           { id: 'pi', name: 'Pi', provider: 'Pi', kind: 'coding-agent', installed: true, version: '1.0.0', source: 'user-cli', path: '/usr/local/bin/pi', error: '', installations: [] },
           { id: 'grok', name: 'Grok', provider: 'xAI', kind: 'coding-agent', installed: true, version: '1.0.0', source: 'user-cli', path: '/usr/local/bin/grok', error: '', installations: [] },
+          { id: 'dsh', name: 'DeepSeek Harness', provider: 'DeepSeek', kind: 'coding-agent', installed: true, version: '0.1.5-rc.1', source: 'user-cli', path: '/usr/local/bin/dsh', error: '', installations: [] },
         ],
       }))
       return
@@ -236,6 +242,7 @@ export async function mockHermesApi(page: Page, options: MockHermesApiOptions = 
           { id: 'codex', installed: true, source: 'user-cli' },
           { id: 'pi', installed: true, source: 'user-cli' },
           { id: 'grok', installed: true, source: 'user-cli' },
+          { id: 'dsh', installed: true, source: 'user-cli' },
         ],
       }))
       return
@@ -910,6 +917,13 @@ export async function mockHermesApi(page: Page, options: MockHermesApiOptions = 
       return
     }
 
+    if (pathname === '/api/coding-agents/dsh/session-presets' && request.method() === 'GET') {
+      await route.fulfill(jsonResponse({ presets: [
+        { id: 'standard', name: 'Standard mode', description: 'File editing and delegation.', isDefault: true },
+        { id: 'minimal', name: 'Minimal mode', description: 'A minimal set of tools.', isDefault: false },
+      ] }))
+      return
+    }
     if (pathname === '/api/coding-agents' && request.method() === 'GET') {
       await route.fulfill(jsonResponse({ tools: [] }))
       return
@@ -971,7 +985,7 @@ export async function authenticate(page: Page, accessKey = TEST_ACCESS_KEY, prof
 }
 
 export async function mockChatSocket(page: Page) {
-  await page.route('**/node_modules/.vite/deps/socket__io-client.js*', async (route) => {
+  await page.route('**/node_modules/.vite/**/socket__io-client.js*', async (route) => {
     await route.fulfill({
       status: 200,
       contentType: 'application/javascript',
